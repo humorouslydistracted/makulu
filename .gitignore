@@ -97,3 +97,6 @@ Thumbs.db
 keystore.properties
 upload-keystore.jks
 *.jks
+
+# Release archives
+makulu-v1.1.0.zip

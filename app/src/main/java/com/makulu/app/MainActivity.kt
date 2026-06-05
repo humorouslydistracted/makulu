@@ -14,6 +14,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -45,12 +48,28 @@ class MainActivity : FragmentActivity() {
     @Inject lateinit var csvManager: CsvManager
     @Inject lateinit var settingsRepo: SettingsRepository
     @Inject lateinit var orderRepo: OrderRepository
+    @Inject lateinit var appResetManager: AppResetManager
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         setContent {
-            MakuluTheme {
+            var themeMode by remember { mutableStateOf("system") }
+            val scope = rememberCoroutineScope()
+            LaunchedEffect(Unit) {
+                themeMode = settingsRepo.get(SettingsRepository.KEY_THEME_MODE) ?: "system"
+            }
+            val darkTheme = when (themeMode) {
+                "light" -> false
+                "dark" -> true
+                else -> isSystemInDarkTheme()
+            }
+            val onThemeChange: (String) -> Unit = { mode ->
+                themeMode = mode
+                scope.launch { settingsRepo.set(SettingsRepository.KEY_THEME_MODE, mode) }
+            }
+
+            MakuluTheme(darkTheme = darkTheme) {
                 var isAuthenticated by remember { mutableStateOf(false) }
                 var setupComplete by remember { mutableStateOf<Boolean?>(null) }
 
@@ -85,19 +104,18 @@ class MainActivity : FragmentActivity() {
                         )
                     }
                     true -> {
-                        // Main app
                         LaunchedEffect(Unit) {
                             printerManager.autoReconnect()
-                            // CSV sync: check if external changes were made
-                            if (csvManager.hasExternalChanges()) {
-                                csvManager.syncFromCsv()
-                            }
                         }
                         MainApp(
                             printerManager = printerManager,
                             csvManager = csvManager,
                             settingsRepo = settingsRepo,
-                            orderRepo = orderRepo
+                            orderRepo = orderRepo,
+                            appResetManager = appResetManager,
+                            themeMode = themeMode,
+                            onThemeChange = onThemeChange,
+                            onAppReset = { setupComplete = false },
                         )
                     }
                 }
@@ -321,16 +339,7 @@ fun FirstTimeSetupFlow(
         0 -> PinSetupScreen(settingsRepo = settingsRepo, onDone = { step = 1 })
         1 -> PrinterSetupScreen(
             printerManager = printerManager,
-            onDone = {
-                scope.launch {
-                    // Seed default tables
-                    val db = MakuluDatabase.getInstance(printerManager.let {
-                        // Get context from settingsRepo — we'll use a workaround
-                        return@let null
-                    } ?: return@launch)
-                }
-                onComplete()
-            },
+            onDone = { onComplete() },
             onSkip = { onComplete() }
         )
     }
@@ -365,14 +374,17 @@ fun PinSetupScreen(settingsRepo: SettingsRepository, onDone: () -> Unit) {
         "What is your pet's name?"
     )
 
+    val scrollState = rememberScrollState()
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(32.dp)
-            .safeDrawingPadding(),
+            .imePadding()
+            .verticalScroll(scrollState)
+            .padding(horizontal = 32.dp, vertical = 24.dp)
+            .safeDrawingPadding()
+            .navigationBarsPadding(),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Spacer(modifier = Modifier.height(32.dp))
         Text("🦁", style = MaterialTheme.typography.headlineLarge)
         Text("Setup Admin PIN", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
         Spacer(modifier = Modifier.height(24.dp))
@@ -384,6 +396,7 @@ fun PinSetupScreen(settingsRepo: SettingsRepository, onDone: () -> Unit) {
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
+            textStyle = makuluTextFieldTextStyle(),
             colors = makuluOutlinedTextFieldColors()
         )
         Spacer(modifier = Modifier.height(8.dp))
@@ -395,18 +408,18 @@ fun PinSetupScreen(settingsRepo: SettingsRepository, onDone: () -> Unit) {
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
+            textStyle = makuluTextFieldTextStyle(),
             colors = makuluOutlinedTextFieldColors()
         )
         Spacer(modifier = Modifier.height(16.dp))
 
-        // Security question
         Text("Security Question (for PIN recovery)", style = MaterialTheme.typography.titleSmall)
         Spacer(modifier = Modifier.height(8.dp))
 
         questions.forEachIndexed { i, q ->
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                 RadioButton(selected = selectedQuestion == i, onClick = { selectedQuestion = i })
-                Text(q, style = MaterialTheme.typography.bodyMedium)
+                Text(q, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
             }
         }
 
@@ -414,12 +427,12 @@ fun PinSetupScreen(settingsRepo: SettingsRepository, onDone: () -> Unit) {
         OutlinedTextField(
             value = answer,
             onValueChange = { input ->
-                // Only lowercase alphabets
                 answer = input.filter { it.isLetter() }.lowercase()
             },
             label = { Text("Answer (lowercase letters only)") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
+            textStyle = makuluTextFieldTextStyle(),
             colors = makuluOutlinedTextFieldColors()
         )
 
@@ -451,6 +464,7 @@ fun PinSetupScreen(settingsRepo: SettingsRepository, onDone: () -> Unit) {
         ) {
             Text("Continue")
         }
+        Spacer(modifier = Modifier.height(32.dp))
     }
 }
 
@@ -531,7 +545,11 @@ fun MainApp(
     printerManager: PrinterManager,
     csvManager: CsvManager,
     settingsRepo: SettingsRepository,
-    orderRepo: OrderRepository
+    orderRepo: OrderRepository,
+    appResetManager: AppResetManager,
+    themeMode: String,
+    onThemeChange: (String) -> Unit,
+    onAppReset: () -> Unit,
 ) {
     val navController = rememberNavController()
     val drawerState = rememberDrawerState(DrawerValue.Closed)
@@ -589,83 +607,111 @@ fun MainApp(
         drawerState = drawerState,
         drawerContent = {
             ModalDrawerSheet {
-                Spacer(modifier = Modifier.height(16.dp))
-                Text("  🦁 Makulu", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, modifier = Modifier.padding(16.dp))
-                HorizontalDivider()
+                Column(
+                    modifier = Modifier
+                        .fillMaxHeight()
+                        .verticalScroll(rememberScrollState())
+                        .padding(bottom = 16.dp),
+                ) {
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text(
+                        "  🦁 Makulu",
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 16.dp),
+                    )
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
 
-                NavigationDrawerItem(
-                    icon = { Icon(Icons.Default.Receipt, contentDescription = null) },
-                    label = { Text("Today's Orders") },
-                    selected = currentRoute == "today_orders",
-                    onClick = {
-                        scope.launch { drawerState.close() }
-                        navController.navigate("today_orders") { launchSingleTop = true }
-                    }
-                )
+                    NavigationDrawerItem(
+                        icon = { Icon(Icons.Default.Receipt, contentDescription = null) },
+                        label = { Text("Today's Orders") },
+                        selected = currentRoute == "today_orders",
+                        onClick = {
+                            scope.launch { drawerState.close() }
+                            navController.navigate("today_orders") { launchSingleTop = true }
+                        },
+                    )
 
-                NavigationDrawerItem(
-                    icon = { Icon(Icons.Default.AttachMoney, contentDescription = null) },
-                    label = { Text("Shop Spending") },
-                    selected = currentRoute == "spending",
-                    onClick = {
-                        scope.launch { drawerState.close() }
-                        navController.navigate("spending") { launchSingleTop = true }
-                    }
-                )
+                    NavigationDrawerItem(
+                        icon = { Icon(Icons.Default.AttachMoney, contentDescription = null) },
+                        label = { Text("Shop Spending") },
+                        selected = currentRoute == "spending",
+                        onClick = {
+                            scope.launch { drawerState.close() }
+                            navController.navigate("spending") { launchSingleTop = true }
+                        },
+                    )
 
-                NavigationDrawerItem(
-                    icon = { Icon(Icons.Default.Print, contentDescription = null) },
-                    label = { Text("Printer") },
-                    selected = currentRoute == "printer",
-                    onClick = {
-                        scope.launch { drawerState.close() }
-                        navController.navigate("printer") { launchSingleTop = true }
-                    }
-                )
+                    NavigationDrawerItem(
+                        icon = { Icon(Icons.Default.Print, contentDescription = null) },
+                        label = { Text("Printer") },
+                        selected = currentRoute == "printer",
+                        onClick = {
+                            scope.launch { drawerState.close() }
+                            navController.navigate("printer") { launchSingleTop = true }
+                        },
+                    )
 
-                HorizontalDivider()
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
 
-                NavigationDrawerItem(
-                    icon = { Icon(Icons.Default.AdminPanelSettings, contentDescription = null) },
-                    label = { Text(if (adminUnlocked) "🔓 Admin" else "🔒 Admin") },
-                    selected = currentRoute.contains("admin") && currentAdminSection == null,
-                    onClick = {
-                        scope.launch { drawerState.close() }
-                        if (adminUnlocked) {
-                            navController.navigate("admin/0") { launchSingleTop = true }
-                        } else {
-                            navController.navigate("admin_pin/0") { launchSingleTop = true }
+                    NavigationDrawerItem(
+                        icon = { Icon(Icons.Default.AdminPanelSettings, contentDescription = null) },
+                        label = { Text(if (adminUnlocked) "🔓 Admin" else "🔒 Admin") },
+                        selected = currentRoute.contains("admin") && currentAdminSection == null,
+                        onClick = {
+                            scope.launch { drawerState.close() }
+                            if (adminUnlocked) {
+                                navController.navigate("admin/0") { launchSingleTop = true }
+                            } else {
+                                navController.navigate("admin_pin/0") { launchSingleTop = true }
+                            }
+                        },
+                    )
+
+                    if (adminUnlocked) {
+                        listOf(
+                            "Tables" to 0,
+                            "Menu Items" to 1,
+                            "Ledger" to 2,
+                            "Spending" to 3,
+                            "Analysis" to 4,
+                            "CSV Backup" to 5,
+                            "Receipt" to 6,
+                            "Inclusions" to 7,
+                        ).forEach { (label, section) ->
+                            NavigationDrawerItem(
+                                icon = { Icon(Icons.Default.ChevronRight, contentDescription = null) },
+                                label = { Text(label) },
+                                selected = currentRoute == "admin/{section}" && currentAdminSection == section,
+                                onClick = {
+                                    scope.launch { drawerState.close() }
+                                    navController.navigate("admin/$section") { launchSingleTop = true }
+                                },
+                                modifier = Modifier.padding(start = 24.dp, end = 8.dp),
+                            )
                         }
-                    }
-                )
 
-                if (adminUnlocked) {
-                    listOf(
-                        "Tables" to 0,
-                        "Menu Items" to 1,
-                        "Ledger" to 2,
-                        "Spending" to 3,
-                        "Analysis" to 4,
-                        "CSV Backup" to 5,
-                        "Receipt" to 6,
-                        "Inclusions" to 7
-                    ).forEach { (label, section) ->
                         NavigationDrawerItem(
-                            icon = { Icon(Icons.Default.ChevronRight, contentDescription = null) },
-                            label = { Text(label) },
-                            selected = currentRoute == "admin/{section}" && currentAdminSection == section,
+                            icon = { Icon(Icons.Default.Settings, contentDescription = null) },
+                            label = { Text("Settings") },
+                            selected = currentRoute == "settings",
                             onClick = {
                                 scope.launch { drawerState.close() }
-                                navController.navigate("admin/$section") { launchSingleTop = true }
+                                navController.navigate("settings") { launchSingleTop = true }
                             },
-                            modifier = Modifier.padding(start = 24.dp, end = 8.dp)
+                            modifier = Modifier.padding(start = 24.dp, end = 8.dp),
                         )
                     }
-                }
 
-                Spacer(modifier = Modifier.weight(1f))
-                HorizontalDivider()
-                Text("  Makulu v1.0.0", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(16.dp))
+                    Spacer(modifier = Modifier.height(16.dp))
+                    HorizontalDivider()
+                    Text(
+                        "  Makulu v${BuildConfig.VERSION_NAME}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(16.dp),
+                    )
+                }
             }
         }
     ) {
@@ -795,6 +841,16 @@ fun MainApp(
                     AdminPrinterSection(printerManager = printerManager, settingsRepo = settingsRepo)
                 }
 
+                composable("settings") {
+                    SettingsScreen(
+                        settingsRepo = settingsRepo,
+                        appResetManager = appResetManager,
+                        themeMode = themeMode,
+                        onThemeChange = onThemeChange,
+                        onAppReset = onAppReset,
+                    )
+                }
+
                 composable("admin_pin/{section}") { entry ->
                     val section = entry.arguments?.getString("section")?.toIntOrNull() ?: 0
                     AdminPinScreen(
@@ -908,11 +964,13 @@ fun ResetPinScreen(settingsRepo: SettingsRepository, onDone: () -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(32.dp)
-            .safeDrawingPadding(),
+            .imePadding()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 32.dp, vertical = 24.dp)
+            .safeDrawingPadding()
+            .navigationBarsPadding(),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Spacer(modifier = Modifier.height(48.dp))
         Icon(Icons.Default.LockReset, contentDescription = null, modifier = Modifier.size(64.dp), tint = MaterialTheme.colorScheme.primary)
         Spacer(modifier = Modifier.height(16.dp))
         Text("Reset Admin PIN", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
@@ -920,8 +978,12 @@ fun ResetPinScreen(settingsRepo: SettingsRepository, onDone: () -> Unit) {
 
         when (step) {
             0 -> {
-                // Security question step
-                Text(question, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+                Text(
+                    question,
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
                 Spacer(modifier = Modifier.height(16.dp))
                 OutlinedTextField(
                     value = answer,
@@ -929,6 +991,7 @@ fun ResetPinScreen(settingsRepo: SettingsRepository, onDone: () -> Unit) {
                     label = { Text("Answer (lowercase letters only)") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
+                    textStyle = makuluTextFieldTextStyle(),
                     colors = makuluOutlinedTextFieldColors()
                 )
                 error?.let {
@@ -960,6 +1023,7 @@ fun ResetPinScreen(settingsRepo: SettingsRepository, onDone: () -> Unit) {
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
+                    textStyle = makuluTextFieldTextStyle(),
                     colors = makuluOutlinedTextFieldColors()
                 )
                 Spacer(modifier = Modifier.height(8.dp))
@@ -970,6 +1034,7 @@ fun ResetPinScreen(settingsRepo: SettingsRepository, onDone: () -> Unit) {
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
+                    textStyle = makuluTextFieldTextStyle(),
                     colors = makuluOutlinedTextFieldColors()
                 )
                 error?.let {

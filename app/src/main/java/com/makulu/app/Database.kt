@@ -222,6 +222,9 @@ interface TableDao {
 
     @Query("UPDATE tables SET sortOrder = :order WHERE id = :id")
     suspend fun updateSortOrder(id: Long, order: Int)
+
+    @Query("DELETE FROM tables")
+    suspend fun deleteAll()
 }
 
 @Dao
@@ -272,13 +275,13 @@ interface OrderDao {
     suspend fun getOrderCountForDate(datePrefix: String): Int
 
     @Query("""
-        SELECT COALESCE(SUM(totalAmount), 0.0) FROM orders 
+        SELECT COALESCE(SUM(COALESCE(NULLIF(finalTotal, 0), totalAmount)), 0.0) FROM orders 
         WHERE status = 'COMPLETED' AND completedAt >= :startDate
     """)
     suspend fun getRevenueSince(startDate: String): Double
 
     @Query("""
-        SELECT COALESCE(SUM(totalAmount), 0.0) FROM orders 
+        SELECT COALESCE(SUM(COALESCE(NULLIF(finalTotal, 0), totalAmount)), 0.0) FROM orders 
         WHERE status = 'COMPLETED' AND completedAt LIKE :datePrefix || '%'
     """)
     suspend fun getRevenueForDate(datePrefix: String): Double
@@ -345,6 +348,9 @@ interface AppSettingsDao {
 
     @Query("SELECT * FROM app_settings")
     suspend fun getAll(): List<AppSettings>
+
+    @Query("DELETE FROM app_settings")
+    suspend fun deleteAll()
 }
 
 @Dao
@@ -369,6 +375,9 @@ interface ReceiptFieldDao {
 
     @Delete
     suspend fun delete(field: ReceiptField)
+
+    @Query("DELETE FROM receipt_fields")
+    suspend fun deleteAll()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

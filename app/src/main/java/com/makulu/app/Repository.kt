@@ -9,8 +9,10 @@ import dagger.hilt.InstallIn
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.time.DayOfWeek
 import java.time.LocalDate
 import java.time.LocalDateTime
@@ -336,6 +338,42 @@ class SettingsRepository @Inject constructor(
         const val KEY_DISCOUNT_ENABLED = "discount_enabled"
         const val KEY_DISCOUNT_TYPE = "discount_type" // "percentage" or "flat"
         const val KEY_DISCOUNT_VALUE = "discount_value"
+        const val KEY_THEME_MODE = "theme_mode" // "light", "dark", or "system"
+    }
+}
+
+@Singleton
+class AppResetManager @Inject constructor(
+    private val orderDao: OrderDao,
+    private val menuItemDao: MenuItemDao,
+    private val categoryDao: CategoryDao,
+    private val tableDao: TableDao,
+    private val shopSpendDao: ShopSpendDao,
+    private val receiptFieldDao: ReceiptFieldDao,
+    private val appSettingsDao: AppSettingsDao,
+    private val csvManager: CsvManager,
+    private val printerManager: PrinterManager,
+) {
+    suspend fun resetApp() = withContext(Dispatchers.IO) {
+        orderDao.deleteAllOrderItems()
+        orderDao.deleteAllOrders()
+        menuItemDao.deleteAll()
+        categoryDao.deleteAll()
+        tableDao.deleteAll()
+        shopSpendDao.deleteAll()
+        receiptFieldDao.deleteAll()
+        appSettingsDao.deleteAll()
+        csvManager.clearBackupFiles()
+        printerManager.disconnect()
+        seedDefaultTablesIfEmpty()
+    }
+
+    private suspend fun seedDefaultTablesIfEmpty() {
+        if (tableDao.getAllSync().isEmpty()) {
+            listOf("T01", "T02", "T03", "T04", "T05").forEachIndexed { index, name ->
+                tableDao.insert(TableInfo(name = name, sortOrder = index))
+            }
+        }
     }
 }
 
@@ -730,6 +768,9 @@ class LedgerViewModel @Inject constructor(
         emitAll(orderRepo.getCompletedOrdersSince(firstOfMonth))
     }.stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
 
+    val allOrders = orderRepo.getAllCompletedOrders()
+        .stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+
     private val _revenueToday = MutableStateFlow(0.0)
     val revenueToday: StateFlow<Double> = _revenueToday.asStateFlow()
 
@@ -825,15 +866,24 @@ class AnalysisViewModel @Inject constructor(
     private val menuRepo: MenuRepository
 ) : ViewModel() {
 
-    data class ItemSales(val name: String, val categoryName: String, val quantity: Int, val revenue: Double)
+    data class ItemSales(
+        val name: String,
+        val categoryName: String,
+        val quantity: Int,
+        val revenue: Double,
+        val isOrphan: Boolean = false,
+    )
+
     data class AnalysisSummary(
         val revenue: Double = 0.0,
         val spending: Double = 0.0,
         val net: Double = 0.0,
-        val itemSales: List<ItemSales> = emptyList()
+        val itemSales: List<ItemSales> = emptyList(),
+        val orphanItemSales: List<ItemSales> = emptyList(),
+        val showPeriodHint: Boolean = false,
     )
 
-    private val _selectedPeriod = MutableStateFlow(0) // 0=Today, 1=Week, 2=Month
+    private val _selectedPeriod = MutableStateFlow(0) // 0=Today, 1=Week, 2=Month, 3=All
     val selectedPeriod: StateFlow<Int> = _selectedPeriod.asStateFlow()
 
     private val _summary = MutableStateFlow(AnalysisSummary())
@@ -860,73 +910,115 @@ class AnalysisViewModel @Inject constructor(
 
     private fun sortItems() {
         val current = _summary.value
-        val sorted = if (_ascending.value) {
-            current.itemSales.sortedBy { it.quantity }
-        } else {
-            current.itemSales.sortedByDescending { it.quantity }
-        }
+        val sorted = sortItemList(current.itemSales)
         _summary.value = current.copy(itemSales = sorted)
     }
 
+    private fun sortItemList(items: List<ItemSales>): List<ItemSales> =
+        if (_ascending.value) items.sortedBy { it.quantity }
+        else items.sortedByDescending { it.quantity }
+
+    private fun normalizeName(name: String): String = name.trim().lowercase()
+
+    private fun effectiveOrderRevenue(order: Order): Double =
+        if (order.finalTotal > 0) order.finalTotal else order.totalAmount
+
+    private data class SalesAcc(var quantity: Int, var revenue: Double)
+
     fun loadAnalysis() {
         viewModelScope.launch {
-            val startDate = when (_selectedPeriod.value) {
-                0 -> LocalDate.now().toString()
+            val period = _selectedPeriod.value
+            val today = LocalDate.now().toString()
+            val startDate = when (period) {
+                0 -> today
                 1 -> LocalDate.now().with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY)).toString()
                 2 -> LocalDate.now().withDayOfMonth(1).toString()
-                else -> LocalDate.now().toString()
+                else -> today
             }
 
-            val revenue = if (_selectedPeriod.value == 0) {
-                orderRepo.getRevenueToday()
-            } else {
-                orderRepo.getRevenueSince(startDate)
+            val orders = when (period) {
+                0 -> orderRepo.getTodayCompletedOrders().first()
+                3 -> orderRepo.getAllCompletedOrders().first()
+                else -> orderRepo.getCompletedOrdersSince(startDate).first()
             }
 
-            val spending = if (_selectedPeriod.value == 0) {
-                spendRepo.getTotalForDate(LocalDate.now().toString())
-            } else {
-                spendRepo.getTotalSince(startDate)
+            val revenue = when (period) {
+                0 -> orderRepo.getRevenueToday()
+                3 -> orders.sumOf { effectiveOrderRevenue(it.order) }
+                else -> orderRepo.getRevenueSince(startDate)
             }
 
-            // Get all menu items for complete list
+            val spending = when (period) {
+                0 -> spendRepo.getTotalForDate(today)
+                3 -> spendRepo.getTotalSince("1970-01-01")
+                else -> spendRepo.getTotalSince(startDate)
+            }
+
+            val allOrders = if (period == 3) orders else orderRepo.getAllCompletedOrders().first()
+            val showPeriodHint = period in 0..2 && orders.isEmpty() && allOrders.isNotEmpty()
+
             val allMenuItems = menuRepo.getAllItemsSync()
             val allCategories = menuRepo.getAllCategoriesSync()
+            val menuById = allMenuItems.associateBy { it.id }
+            val menuByName = allMenuItems.associateBy { normalizeName(it.name) }
 
-            // Get orders for period and calculate item sales
-            val orders = if (_selectedPeriod.value == 0) {
-                orderRepo.getTodayCompletedOrders().first()
-            } else {
-                orderRepo.getCompletedOrdersSince(startDate).first()
-            }
+            val salesByMenuId = mutableMapOf<Long, SalesAcc>()
+            val orphanSales = mutableMapOf<String, Pair<String, SalesAcc>>()
 
-            val salesMap = mutableMapOf<Long, Pair<String, Int>>()
             orders.forEach { owi ->
                 owi.items.forEach { item ->
-                    val current = salesMap[item.menuItemId]
-                    salesMap[item.menuItemId] = Pair(
-                        item.menuItemName,
-                        (current?.second ?: 0) + item.quantity
-                    )
+                    val lineRevenue = item.price * item.quantity
+                    val matchedMenu = when {
+                        item.menuItemId > 0 && menuById.containsKey(item.menuItemId) ->
+                            menuById[item.menuItemId]
+                        else -> menuByName[normalizeName(item.menuItemName)]
+                    }
+                    if (matchedMenu != null) {
+                        val acc = salesByMenuId.getOrPut(matchedMenu.id) { SalesAcc(0, 0.0) }
+                        acc.quantity += item.quantity
+                        acc.revenue += lineRevenue
+                    } else {
+                        val key = normalizeName(item.menuItemName)
+                        val entry = orphanSales.getOrPut(key) {
+                            item.menuItemName to SalesAcc(0, 0.0)
+                        }
+                        entry.second.quantity += item.quantity
+                        entry.second.revenue += lineRevenue
+                    }
                 }
             }
 
-            // Include all menu items (show 0 for unsold)
-            val itemSales = allMenuItems.map { mi ->
-                val sold = salesMap[mi.id]
-                ItemSales(
-                    name = sold?.first ?: mi.name,
-                    categoryName = allCategories.firstOrNull { it.id == mi.categoryId }?.name ?: "Uncategorized",
-                    quantity = sold?.second ?: 0,
-                    revenue = (sold?.second ?: 0) * mi.price
-                )
-            }.sortedByDescending { it.quantity }
+            val itemSales = sortItemList(
+                allMenuItems.map { mi ->
+                    val acc = salesByMenuId[mi.id]
+                    ItemSales(
+                        name = mi.name,
+                        categoryName = allCategories.firstOrNull { it.id == mi.categoryId }?.name ?: "Uncategorized",
+                        quantity = acc?.quantity ?: 0,
+                        revenue = acc?.revenue ?: 0.0,
+                    )
+                }
+            )
+
+            val orphanItemSales = orphanSales.values
+                .map { (displayName, acc) ->
+                    ItemSales(
+                        name = displayName,
+                        categoryName = "Items not in menu",
+                        quantity = acc.quantity,
+                        revenue = acc.revenue,
+                        isOrphan = true,
+                    )
+                }
+                .sortedByDescending { it.quantity }
 
             _summary.value = AnalysisSummary(
                 revenue = revenue,
                 spending = spending,
                 net = revenue - spending,
-                itemSales = itemSales
+                itemSales = itemSales,
+                orphanItemSales = orphanItemSales,
+                showPeriodHint = showPeriodHint,
             )
         }
     }

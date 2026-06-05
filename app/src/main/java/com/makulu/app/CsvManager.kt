@@ -24,6 +24,7 @@ class CsvManager @Inject constructor(
     private val orderDao: OrderDao,
     private val menuItemDao: MenuItemDao,
     private val categoryDao: CategoryDao,
+    private val tableDao: TableDao,
     private val shopSpendDao: ShopSpendDao,
     private val appSettingsDao: AppSettingsDao,
     private val receiptFieldDao: ReceiptFieldDao
@@ -91,7 +92,7 @@ class CsvManager @Inject constructor(
             owi.items.forEach { item ->
                 rows.append("${owi.order.orderNumber},${owi.order.tableName},${owi.order.completedAt},")
                 rows.append("${escapeCsv(item.menuItemName)},${item.quantity},${item.price},${item.lineTotal},")
-                rows.append("${owi.order.totalAmount},${owi.order.discountAmount},${owi.order.cgstAmount},${owi.order.sgstAmount},${owi.order.finalTotal},${escapeCsv(owi.order.paymentMode)},${owi.order.status}\n")
+                rows.append("${owi.order.totalAmount},${owi.order.discountAmount},${owi.order.cgstAmount},${owi.order.sgstAmount},${owi.order.finalTotal},${escapeCsv(owi.order.paymentMode)},${owi.order.status.name}\n")
             }
         }
 
@@ -132,7 +133,10 @@ class CsvManager @Inject constructor(
         val allOrders = orderDao.getAllCompletedOrdersSync()
         val spends = shopSpendDao.getAllSync()
 
-        val totalRevenue = allOrders.sumOf { it.order.totalAmount }
+        val totalRevenue = allOrders.sumOf { owi ->
+            val o = owi.order
+            if (o.finalTotal > 0) o.finalTotal else o.totalAmount
+        }
         val totalSpending = spends.sumOf { it.amount }
         val totalOrders = allOrders.size
 
@@ -196,175 +200,413 @@ class CsvManager @Inject constructor(
         return appFiles to docFiles
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // CSV SYNC: Check if app folder CSVs were modified externally
-    // ─────────────────────────────────────────────────────────────────────────
-
     private val LAST_EXPORT_KEY = "csv_last_export_timestamp"
 
-    /** Returns true if CSV files appear to have been modified externally since last export */
-    suspend fun hasExternalChanges(): Boolean {
-        val lastExport = appSettingsDao.get(LAST_EXPORT_KEY)?.toLongOrNull() ?: return false
-        val appFolder = getAppFolder()
-        val latestFiles = appFolder.listFiles()?.filter { it.name.contains("_latest.csv") } ?: return false
-        return latestFiles.any { it.lastModified() > lastExport }
-    }
-
-    /** Update the last export timestamp to current time */
     private suspend fun markExportTime() {
         appSettingsDao.set(AppSettings(LAST_EXPORT_KEY, System.currentTimeMillis().toString()))
     }
 
+    /** Delete all CSV backup files from app and Documents folders. */
+    suspend fun clearBackupFiles() = withContext(Dispatchers.IO) {
+        getAppFolder().listFiles()?.filter { it.extension == "csv" }?.forEach { it.delete() }
+        getDocumentsFolder().listFiles()?.filter { it.extension == "csv" }?.forEach { it.delete() }
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
-    // CSV IMPORT: Import from a directory, replacing all data
+    // CSV IMPORT: Per-section import with filename + schema validation
     // ─────────────────────────────────────────────────────────────────────────
 
-    data class ImportResult(val success: Boolean, val message: String, val ordersImported: Int = 0, val spendsImported: Int = 0, val menuItemsImported: Int = 0)
+    enum class ImportSection { ORDERS, MENU, SPENDING }
 
-    /** Import CSV files from a given directory. Replaces all existing data. */
-    suspend fun importFromDirectory(directory: File): ImportResult = withContext(Dispatchers.IO) {
-        try {
-            var ordersImported = 0
-            var spendsImported = 0
-            var menuItemsImported = 0
+    data class SectionValidationResult(
+        val valid: Boolean,
+        val errorMessage: String? = null,
+        val missingHeaders: List<String> = emptyList(),
+        val unexpectedHeaders: List<String> = emptyList(),
+        val rowCount: Int = 0,
+    )
 
-            // Import menu items
-            val menuFile = findLatestFile(directory, "menu_items")
-            if (menuFile != null) {
-                menuItemsImported = importMenuItems(menuFile)
-            }
+    data class SectionImportResult(
+        val success: Boolean,
+        val message: String,
+        val rowsImported: Int = 0,
+    )
 
-            // Import spending
-            val spendFile = findLatestFile(directory, "spending")
-            if (spendFile != null) {
-                spendsImported = importSpending(spendFile)
-            }
+    private val ORDERS_HEADERS = listOf(
+        "OrderNumber", "Table", "Date", "ItemName", "Quantity", "Price", "LineTotal",
+        "OrderTotal", "Discount", "CGST", "SGST", "FinalTotal", "PaymentMode", "Status",
+    )
+    private val SPENDING_HEADERS = listOf("ItemName", "Amount", "Date", "CreatedAt")
+    private val MENU_HEADERS = listOf("ItemName", "Price", "Category", "IsAvailable", "SortOrder")
 
-            // Import orders
-            val orderFile = findLatestFile(directory, "orders")
-            if (orderFile != null) {
-                ordersImported = importOrders(orderFile)
-            }
+    private val ORDERS_FILENAME = Regex("""(?i)makulu_orders(_latest|_\d{4}-\d{2})\.csv""")
+    private val MENU_FILENAME = Regex("""(?i)makulu_menu_items(_latest|_\d{4}-\d{2})\.csv""")
+    private val SPENDING_FILENAME = Regex("""(?i)makulu_spending(_latest|_\d{4}-\d{2})\.csv""")
+    private val MONTHLY_ARCHIVE = Regex("""(?i)_\d{4}-\d{2}\.csv$""")
+    private val ISO_DATE_PREFIX = Regex("""^\d{4}-\d{2}-\d{2}""")
 
-            ImportResult(true, "Import complete", ordersImported, spendsImported, menuItemsImported)
-        } catch (e: Exception) {
-            ImportResult(false, "Import failed: ${e.message}")
+    fun expectedFilenameHint(section: ImportSection): String = when (section) {
+        ImportSection.ORDERS -> "makulu_orders_latest.csv or makulu_orders_YYYY-MM.csv"
+        ImportSection.MENU -> "makulu_menu_items_latest.csv or makulu_menu_items_YYYY-MM.csv"
+        ImportSection.SPENDING -> "makulu_spending_latest.csv or makulu_spending_YYYY-MM.csv"
+    }
+
+    fun latestFilenameHint(section: ImportSection): String = when (section) {
+        ImportSection.ORDERS -> "makulu_orders_latest.csv"
+        ImportSection.MENU -> "makulu_menu_items_latest.csv"
+        ImportSection.SPENDING -> "makulu_spending_latest.csv"
+    }
+
+    fun validateFilename(fileName: String, section: ImportSection): Boolean {
+        val name = fileName.substringAfterLast('/')
+        return when (section) {
+            ImportSection.ORDERS -> ORDERS_FILENAME.matches(name)
+            ImportSection.MENU -> MENU_FILENAME.matches(name)
+            ImportSection.SPENDING -> SPENDING_FILENAME.matches(name)
         }
     }
 
-    /** Sync from app folder CSVs into DB (for external edits) */
-    suspend fun syncFromCsv(): ImportResult {
-        return importFromDirectory(getAppFolder())
+    fun isMonthlyArchive(fileName: String): Boolean {
+        val name = fileName.substringAfterLast('/')
+        return MONTHLY_ARCHIVE.containsMatchIn(name) && !name.contains("_latest", ignoreCase = true)
     }
 
-    private fun findLatestFile(dir: File, nameContains: String): File? {
-        return dir.listFiles()
-            ?.filter { it.name.contains(nameContains) && it.extension == "csv" }
-            ?.maxByOrNull { it.lastModified() }
+    fun validateHeaders(file: File, section: ImportSection): SectionValidationResult {
+        val expected = when (section) {
+            ImportSection.ORDERS -> ORDERS_HEADERS
+            ImportSection.MENU -> MENU_HEADERS
+            ImportSection.SPENDING -> SPENDING_HEADERS
+        }
+        val lines = file.readLines()
+        if (lines.isEmpty()) {
+            return SectionValidationResult(false, "File is empty.")
+        }
+        val actual = parseCsvLine(lines.first()).map { it.trim() }
+        val expectedNorm = expected.map { it.lowercase() }
+        val actualNorm = actual.map { it.lowercase() }
+
+        if (actualNorm != expectedNorm) {
+            val missing = expected.filter { it.lowercase() !in actualNorm }
+            val unexpected = actual.filter { it.isNotBlank() && it.lowercase() !in expectedNorm }
+            val detail = buildString {
+                if (missing.isNotEmpty()) append("Missing: ${missing.joinToString(", ")}.")
+                if (unexpected.isNotEmpty()) {
+                    if (isNotEmpty()) append(" ")
+                    append("Unexpected: ${unexpected.joinToString(", ")}.")
+                }
+            }
+            val base = "File structure is invalid. Expected columns are missing or incorrect. Please upload a valid backup file."
+            return SectionValidationResult(
+                valid = false,
+                errorMessage = if (detail.isNotBlank()) "$base\n$detail" else base,
+                missingHeaders = missing,
+                unexpectedHeaders = unexpected,
+            )
+        }
+
+        return SectionValidationResult(valid = true, rowCount = lines.size - 1)
     }
+
+    /** Non-blocking hint when date columns may not work with Today/Week/Month filters. */
+    fun checkDateFormatWarning(file: File, section: ImportSection): String? {
+        val lines = file.readLines().drop(1).filter { it.isNotBlank() }
+        if (lines.isEmpty()) return null
+        val sampleDates = lines.take(5).mapNotNull { line ->
+            val cols = parseCsvLine(line)
+            when (section) {
+                ImportSection.ORDERS -> cols.getOrNull(2)?.trim()
+                ImportSection.SPENDING -> cols.getOrNull(2)?.trim()
+                ImportSection.MENU -> null
+            }
+        }
+        if (sampleDates.isEmpty()) return null
+        if (sampleDates.any { !ISO_DATE_PREFIX.containsMatchIn(it) }) {
+            return "Some dates in this file are not in YYYY-MM-DD format. " +
+                "Imported data may not appear under Today/Week/Month filters. Use Analysis or Ledger All/History, or re-export from Makulu."
+        }
+        return null
+    }
+
+    suspend fun importSection(file: File, fileName: String, section: ImportSection): SectionImportResult =
+        withContext(Dispatchers.IO) {
+            try {
+                if (!validateFilename(fileName, section)) {
+                    return@withContext SectionImportResult(
+                        success = false,
+                        message = "Expected filename: ${expectedFilenameHint(section)}. Please select the correct file.",
+                    )
+                }
+
+                val headerCheck = validateHeaders(file, section)
+                if (!headerCheck.valid) {
+                    return@withContext SectionImportResult(
+                        success = false,
+                        message = headerCheck.errorMessage ?: "Invalid file structure.",
+                    )
+                }
+
+                val rowsImported = when (section) {
+                    ImportSection.ORDERS -> {
+                        val parsed = parseOrders(file)
+                        if (parsed.isEmpty()) {
+                            return@withContext SectionImportResult(false, "File has no data rows.")
+                        }
+                        applyOrdersImport(parsed)
+                    }
+                    ImportSection.MENU -> {
+                        val parsed = parseMenuItems(file)
+                        if (parsed.items.isEmpty()) {
+                            return@withContext SectionImportResult(false, "File has no data rows.")
+                        }
+                        applyMenuImport(parsed)
+                    }
+                    ImportSection.SPENDING -> {
+                        val spends = parseSpending(file)
+                        if (spends.isEmpty()) {
+                            return@withContext SectionImportResult(false, "File has no data rows.")
+                        }
+                        applySpendingImport(spends)
+                    }
+                }
+
+                val label = when (section) {
+                    ImportSection.ORDERS -> "orders"
+                    ImportSection.MENU -> "menu items"
+                    ImportSection.SPENDING -> "spending entries"
+                }
+                SectionImportResult(
+                    success = true,
+                    message = "Imported $rowsImported $label.",
+                    rowsImported = rowsImported,
+                )
+            } catch (e: Exception) {
+                SectionImportResult(false, "Import failed: ${e.message}")
+            }
+        }
+
+    private data class ParsedMenuImport(
+        val categories: List<Pair<String, Int>>,
+        val items: List<MenuItemDraft>
+    )
+
+    private data class MenuItemDraft(
+        val name: String,
+        val price: Double,
+        val categoryName: String,
+        val isAvailable: Boolean,
+        val sortOrder: Int
+    )
+
+    private data class ParsedOrderImport(
+        val order: Order,
+        val items: List<OrderItemDraft>
+    )
+
+    private data class OrderItemDraft(
+        val menuItemName: String,
+        val price: Double,
+        val quantity: Int
+    )
 
     private suspend fun importMenuItems(file: File): Int {
-        val lines = file.readLines().drop(1) // Skip header
-        if (lines.isEmpty()) return 0
+        val parsed = parseMenuItems(file)
+        if (parsed.items.isEmpty()) return 0
+        return applyMenuImport(parsed)
+    }
 
-        // Clear existing
+    private suspend fun applyMenuImport(parsed: ParsedMenuImport): Int {
         menuItemDao.deleteAll()
         categoryDao.deleteAll()
 
-        // Parse and insert
         val categoryMap = mutableMapOf<String, Long>()
-        var catOrder = 0
-        val items = mutableListOf<MenuItem>()
+        parsed.categories.forEach { (name, sortOrder) ->
+            categoryMap[name] = categoryDao.insert(Category(name = name, sortOrder = sortOrder))
+        }
 
-        lines.forEach { line ->
-            val cols = parseCsvLine(line)
-            if (cols.size >= 4) {
-                val itemName = cols[0]
-                val price = cols[1].toDoubleOrNull() ?: 0.0
-                val catName = cols[2]
-                val isAvailable = cols[3].toBooleanStrictOrNull() ?: true
-                val sortOrder = cols.getOrNull(4)?.toIntOrNull() ?: 0
-
-                if (!categoryMap.containsKey(catName)) {
-                    val catId = categoryDao.insert(Category(name = catName, sortOrder = catOrder++))
-                    categoryMap[catName] = catId
-                }
-
-                items.add(MenuItem(name = itemName, price = price, categoryId = categoryMap[catName]!!, isAvailable = isAvailable, sortOrder = sortOrder))
-            }
+        val items = parsed.items.map { draft ->
+            MenuItem(
+                name = draft.name,
+                price = draft.price,
+                categoryId = categoryMap[draft.categoryName]!!,
+                isAvailable = draft.isAvailable,
+                sortOrder = draft.sortOrder
+            )
         }
         menuItemDao.insertAll(items)
         return items.size
     }
 
-    private suspend fun importSpending(file: File): Int {
+    private fun parseMenuItems(file: File): ParsedMenuImport {
         val lines = file.readLines().drop(1)
-        if (lines.isEmpty()) return 0
+        if (lines.isEmpty()) return ParsedMenuImport(emptyList(), emptyList())
 
-        shopSpendDao.deleteAll()
-        val spends = mutableListOf<ShopSpend>()
+        val categoryOrder = linkedMapOf<String, Int>()
+        var catOrder = 0
+        val items = mutableListOf<MenuItemDraft>()
 
         lines.forEach { line ->
             val cols = parseCsvLine(line)
-            if (cols.size >= 3) {
-                val itemName = cols[0]
-                val amount = cols[1].toDoubleOrNull() ?: 0.0
-                val date = cols[2]
-                val createdAt = cols.getOrNull(3) ?: date
-                spends.add(ShopSpend(itemName = itemName, amount = amount, date = date, createdAt = createdAt))
+            if (cols.size >= 4) {
+                val catName = cols[2]
+                if (!categoryOrder.containsKey(catName)) {
+                    categoryOrder[catName] = catOrder++
+                }
+                items.add(
+                    MenuItemDraft(
+                        name = cols[0],
+                        price = cols[1].toDoubleOrNull() ?: 0.0,
+                        categoryName = catName,
+                        isAvailable = cols[3].toBooleanStrictOrNull() ?: true,
+                        sortOrder = cols.getOrNull(4)?.toIntOrNull() ?: 0
+                    )
+                )
             }
         }
+        return ParsedMenuImport(categoryOrder.map { it.key to it.value }, items)
+    }
+
+    private suspend fun importSpending(file: File): Int {
+        val spends = parseSpending(file)
+        if (spends.isEmpty()) return 0
+        return applySpendingImport(spends)
+    }
+
+    private suspend fun applySpendingImport(spends: List<ShopSpend>): Int {
+        shopSpendDao.deleteAll()
         shopSpendDao.insertAll(spends)
         return spends.size
     }
 
-    private suspend fun importOrders(file: File): Int {
+    private fun parseSpending(file: File): List<ShopSpend> {
         val lines = file.readLines().drop(1)
-        if (lines.isEmpty()) return 0
+        if (lines.isEmpty()) return emptyList()
 
+        val spends = mutableListOf<ShopSpend>()
+        lines.forEach { line ->
+            val cols = parseCsvLine(line)
+            if (cols.size >= 3) {
+                val date = cols[2]
+                spends.add(
+                    ShopSpend(
+                        itemName = cols[0],
+                        amount = cols[1].toDoubleOrNull() ?: 0.0,
+                        date = date,
+                        createdAt = cols.getOrNull(3) ?: date
+                    )
+                )
+            }
+        }
+        return spends
+    }
+
+    private suspend fun importOrders(file: File): Int {
+        val parsed = parseOrders(file)
+        if (parsed.isEmpty()) return 0
+        return applyOrdersImport(parsed)
+    }
+
+    private suspend fun applyOrdersImport(parsed: List<ParsedOrderImport>): Int {
         orderDao.deleteAllOrderItems()
         orderDao.deleteAllOrders()
 
-        // Group by order number
-        val orderGroups = mutableMapOf<String, MutableList<List<String>>>()
+        val menuByName = menuItemDao.getAllSync().associateBy { it.name.trim().lowercase() }
+        val tableByName = tableDao.getAllSync().associateBy { it.name.trim().lowercase() }
+
+        parsed.forEach { entry ->
+            val tableId = tableByName[entry.order.tableName.trim().lowercase()]?.id ?: 0L
+            val orderId = orderDao.insertOrder(entry.order.copy(tableId = tableId))
+            orderDao.insertOrderItems(
+                entry.items.map { draft ->
+                    val menuItemId = menuByName[draft.menuItemName.trim().lowercase()]?.id ?: 0L
+                    OrderItem(
+                        orderId = orderId,
+                        menuItemId = menuItemId,
+                        menuItemName = draft.menuItemName,
+                        price = draft.price,
+                        quantity = draft.quantity
+                    )
+                }
+            )
+        }
+        return parsed.size
+    }
+
+    private fun parseOrders(file: File): List<ParsedOrderImport> {
+        val lines = file.readLines().drop(1)
+        if (lines.isEmpty()) return emptyList()
+
+        val orderGroups = linkedMapOf<String, MutableList<List<String>>>()
         lines.forEach { line ->
             val cols = parseCsvLine(line)
             if (cols.size >= 8) {
-                val orderNumber = cols[0]
-                orderGroups.getOrPut(orderNumber) { mutableListOf() }.add(cols)
+                orderGroups.getOrPut(cols[0]) { mutableListOf() }.add(cols)
             }
         }
 
-        var count = 0
-        orderGroups.forEach { (orderNumber, rows) ->
+        return orderGroups.map { (orderNumber, rows) ->
             val firstRow = rows.first()
             val tableName = firstRow[1]
             val completedAt = firstRow[2]
-            val total = firstRow[7].toDoubleOrNull() ?: 0.0
-            val status = firstRow.getOrNull(8) ?: "COMPLETED"
+            val totalAmount = firstRow[7].toDoubleOrNull() ?: 0.0
 
-            val orderId = orderDao.insertOrder(Order(
-                orderNumber = orderNumber,
-                tableId = 0, // Can't recover original table ID
-                tableName = tableName,
-                status = OrderStatus.valueOf(status),
-                totalAmount = total,
-                completedAt = completedAt
-            ))
+            val discountAmount: Double
+            val cgstAmount: Double
+            val sgstAmount: Double
+            val finalTotal: Double
+            val paymentMode: String
+            val status: OrderStatus
 
-            val orderItems = rows.map { cols ->
-                OrderItem(
-                    orderId = orderId,
-                    menuItemId = 0,
-                    menuItemName = cols[3],
-                    price = cols[5].toDoubleOrNull() ?: 0.0,
-                    quantity = cols[4].toIntOrNull() ?: 1
-                )
+            if (firstRow.size >= 14) {
+                discountAmount = firstRow[8].toDoubleOrNull() ?: 0.0
+                cgstAmount = firstRow[9].toDoubleOrNull() ?: 0.0
+                sgstAmount = firstRow[10].toDoubleOrNull() ?: 0.0
+                finalTotal = firstRow[11].toDoubleOrNull() ?: totalAmount
+                paymentMode = firstRow[12]
+                status = parseOrderStatus(firstRow[13])
+            } else {
+                discountAmount = 0.0
+                cgstAmount = 0.0
+                sgstAmount = 0.0
+                finalTotal = totalAmount
+                paymentMode = ""
+                status = parseOrderStatus(firstRow.getOrNull(8))
             }
-            orderDao.insertOrderItems(orderItems)
-            count++
+
+            ParsedOrderImport(
+                order = Order(
+                    orderNumber = orderNumber,
+                    tableId = 0,
+                    tableName = tableName,
+                    status = status,
+                    totalAmount = totalAmount,
+                    discountAmount = discountAmount,
+                    cgstAmount = cgstAmount,
+                    sgstAmount = sgstAmount,
+                    finalTotal = finalTotal,
+                    paymentMode = paymentMode,
+                    completedAt = completedAt
+                ),
+                items = rows.map { cols ->
+                    OrderItemDraft(
+                        menuItemName = cols[3],
+                        price = cols[5].toDoubleOrNull() ?: 0.0,
+                        quantity = cols[4].toIntOrNull() ?: 1
+                    )
+                }
+            )
         }
-        return count
+    }
+
+    private fun parseOrderStatus(raw: String?): OrderStatus {
+        val normalized = raw?.trim()?.uppercase() ?: return OrderStatus.COMPLETED
+        return runCatching { OrderStatus.valueOf(normalized) }.getOrElse {
+            when (normalized) {
+                "COMPLETE" -> OrderStatus.COMPLETED
+                "PLACED" -> OrderStatus.PLACED
+                "DRAFT" -> OrderStatus.DRAFT
+                else -> OrderStatus.COMPLETED
+            }
+        }
     }
 
     private fun parseCsvLine(line: String): List<String> {

@@ -9,6 +9,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
+import androidx.compose.foundation.text.selection.TextSelectionColors
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
@@ -117,14 +118,32 @@ fun MakuluTheme(
 }
 
 @Composable
+fun makuluTextFieldTextStyle() = MaterialTheme.typography.bodyLarge.copy(
+    color = MaterialTheme.colorScheme.onSurface
+)
+
+@Composable
 fun makuluOutlinedTextFieldColors() = OutlinedTextFieldDefaults.colors(
     focusedTextColor = MaterialTheme.colorScheme.onSurface,
     unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
+    disabledTextColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
+    errorTextColor = MaterialTheme.colorScheme.error,
     focusedLabelColor = MaterialTheme.colorScheme.primary,
     unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+    disabledLabelColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f),
+    errorLabelColor = MaterialTheme.colorScheme.error,
     cursorColor = MaterialTheme.colorScheme.primary,
+    errorCursorColor = MaterialTheme.colorScheme.error,
     focusedBorderColor = MaterialTheme.colorScheme.primary,
     unfocusedBorderColor = MaterialTheme.colorScheme.outline,
+    disabledBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.38f),
+    errorBorderColor = MaterialTheme.colorScheme.error,
     focusedContainerColor = MaterialTheme.colorScheme.surface,
-    unfocusedContainerColor = MaterialTheme.colorScheme.surface
+    unfocusedContainerColor = MaterialTheme.colorScheme.surface,
+    disabledContainerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.6f),
+    errorContainerColor = MaterialTheme.colorScheme.surface,
+    selectionColors = TextSelectionColors(
+        handleColor = MaterialTheme.colorScheme.primary,
+        backgroundColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.35f),
+    ),
 )

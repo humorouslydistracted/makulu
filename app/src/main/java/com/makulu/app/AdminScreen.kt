@@ -112,6 +112,7 @@ fun AdminPinScreen(
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
                 keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = { submitPin() }),
                 singleLine = true,
+                textStyle = makuluTextFieldTextStyle(),
                 colors = makuluOutlinedTextFieldColors()
             )
 
@@ -156,7 +157,10 @@ fun AdminScreen(
             1 -> AdminMenuItemsSection(adminVm)
             2 -> AdminLedgerSection(ledgerVm)
             3 -> AdminSpendingSection(spendVm)
-            4 -> AdminAnalysisSection(analysisVm)
+            4 -> {
+                LaunchedEffect(Unit) { analysisVm.loadAnalysis() }
+                AdminAnalysisSection(analysisVm)
+            }
             5 -> AdminCsvSection(csvManager)
             6 -> AdminReceiptSection(adminVm, settingsRepo)
             7 -> AdminInclusionsSection(settingsRepo)
@@ -398,7 +402,15 @@ fun AdminMenuItemsSection(vm: AdminViewModel) {
                 Column {
                     OutlinedTextField(value = editName, onValueChange = { editName = sanitizeInput(it, 40) }, label = { Text("Name") }, singleLine = true, colors = makuluOutlinedTextFieldColors())
                     Spacer(modifier = Modifier.height(8.dp))
-                    OutlinedTextField(value = editPrice, onValueChange = { editPrice = it }, label = { Text("Price (₹)") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
+                    OutlinedTextField(
+                        value = editPrice,
+                        onValueChange = { editPrice = it },
+                        label = { Text("Price (₹)") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        textStyle = makuluTextFieldTextStyle(),
+                        colors = makuluOutlinedTextFieldColors(),
+                    )
                 }
             },
             confirmButton = {
@@ -449,6 +461,7 @@ fun AdminMenuItemsSection(vm: AdminViewModel) {
 @Composable
 fun AdminLedgerSection(vm: LedgerViewModel) {
     val selectedTab by vm.selectedTab.collectAsState()
+    val allOrders by vm.allOrders.collectAsState()
     val todayOrders by vm.todayOrders.collectAsState()
     val weekOrders by vm.weekOrders.collectAsState()
     val monthOrders by vm.monthOrders.collectAsState()
@@ -459,7 +472,13 @@ fun AdminLedgerSection(vm: LedgerViewModel) {
     var selectedOrder by remember { mutableStateOf<OrderWithItems?>(null) }
     var pendingDeleteOrderId by remember { mutableStateOf<Long?>(null) }
 
-    val orders = when (selectedTab) { 0 -> todayOrders; 1 -> todayOrders; 2 -> weekOrders; 3 -> monthOrders; else -> todayOrders }
+    val orders = when (selectedTab) {
+        0 -> allOrders
+        1 -> todayOrders
+        2 -> weekOrders
+        3 -> monthOrders
+        else -> todayOrders
+    }
     val revenue = when (selectedTab) { 1 -> revenueToday; 2 -> revenueWeek; 3 -> revenueMonth; else -> revenueToday }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
@@ -599,8 +618,18 @@ fun AdminSpendingSection(vm: SpendingViewModel) {
 
         Spacer(modifier = Modifier.height(8.dp))
 
+        val today = LocalDate.now().toString()
+        val weekStart = LocalDate.now().with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY)).toString()
+        val monthStart = LocalDate.now().withDayOfMonth(1).toString()
+        val displaySpends = when (selectedTab) {
+            1 -> allSpends.filter { it.date == today }
+            2 -> allSpends.filter { it.date >= weekStart }
+            3 -> allSpends.filter { it.date >= monthStart }
+            else -> allSpends
+        }
+
         LazyColumn {
-            items(allSpends) { spend ->
+            items(displaySpends) { spend ->
                 Card(
                     modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
                     onClick = {
@@ -738,16 +767,23 @@ fun AdminAnalysisSection(vm: AnalysisViewModel) {
     LaunchedEffect(Unit) { vm.loadAnalysis() }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        // Period selector
         TabRow(selectedTabIndex = period) {
-            listOf("Today", "Week", "Month").forEachIndexed { i, t ->
+            listOf("Today", "Week", "Month", "All").forEachIndexed { i, t ->
                 Tab(selected = period == i, onClick = { vm.selectPeriod(i) }) { Text(t, modifier = Modifier.padding(12.dp)) }
             }
         }
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // Revenue vs Spending
+        if (summary.showPeriodHint) {
+            Text(
+                "No data in this period. Try All — imported backups often have older dates.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
+        }
+
         Card(modifier = Modifier.fillMaxWidth()) {
             Row(modifier = Modifier.padding(16.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -789,11 +825,11 @@ fun AdminAnalysisSection(vm: AnalysisViewModel) {
         HorizontalDivider()
 
         val itemsToShow = if (showAll) summary.itemSales else summary.itemSales.take(20)
-        val totalQty = summary.itemSales.sumOf { it.quantity }.coerceAtLeast(1)
+        val orphanItems = summary.orphanItemSales
+        val totalQty = (summary.itemSales.sumOf { it.quantity } + orphanItems.sumOf { it.quantity }).coerceAtLeast(1)
 
         LazyColumn(modifier = Modifier.weight(1f)) {
             if (showCategory) {
-                // Group by category
                 val grouped = itemsToShow.groupBy { it.categoryName }
                 grouped.forEach { (catName, catItems) ->
                     val catQty = catItems.sumOf { it.quantity }
@@ -809,7 +845,31 @@ fun AdminAnalysisSection(vm: AnalysisViewModel) {
                         }
                         HorizontalDivider(color = MaterialTheme.colorScheme.primary.copy(alpha = 0.3f))
                     }
-                    itemsIndexed(catItems) { index, sale ->
+                    itemsIndexed(catItems, key = { _, sale -> "cat_${catName}_${sale.name}" }) { index, sale ->
+                        val pct = (sale.quantity * 100.0 / totalQty)
+                        Row(modifier = Modifier.fillMaxWidth().padding(start = 8.dp, top = 2.dp, bottom = 2.dp)) {
+                            Text("${index + 1}", modifier = Modifier.width(28.dp), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(sale.name, modifier = Modifier.weight(1f), fontSize = 13.sp)
+                            Text("${sale.quantity}", modifier = Modifier.width(40.dp), fontSize = 13.sp)
+                            Text("${"%.1f".format(pct)}%", modifier = Modifier.width(48.dp), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                }
+                if (orphanItems.isNotEmpty()) {
+                    val orphanQty = orphanItems.sumOf { it.quantity }
+                    val orphanPct = (orphanQty * 100.0 / totalQty)
+                    item(key = "cat_header_orphans") {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Items not in menu", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f), color = MaterialTheme.colorScheme.tertiary)
+                            Text("$orphanQty", modifier = Modifier.width(40.dp), fontWeight = FontWeight.Bold)
+                            Text("${"%.1f".format(orphanPct)}%", modifier = Modifier.width(48.dp), fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.tertiary)
+                        }
+                        HorizontalDivider(color = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.3f))
+                    }
+                    itemsIndexed(orphanItems, key = { _, sale -> "orphan_${sale.name}" }) { index, sale ->
                         val pct = (sale.quantity * 100.0 / totalQty)
                         Row(modifier = Modifier.fillMaxWidth().padding(start = 8.dp, top = 2.dp, bottom = 2.dp)) {
                             Text("${index + 1}", modifier = Modifier.width(28.dp), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -820,14 +880,34 @@ fun AdminAnalysisSection(vm: AnalysisViewModel) {
                     }
                 }
             } else {
-                // Flat list
-                itemsIndexed(itemsToShow) { index, sale ->
+                itemsIndexed(itemsToShow, key = { _, sale -> "list_${sale.name}" }) { index, sale ->
                     val pct = (sale.quantity * 100.0 / totalQty)
                     Row(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
                         Text("${index + 1}", modifier = Modifier.width(28.dp), fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         Text(sale.name, modifier = Modifier.weight(1f), fontSize = 13.sp)
                         Text("${sale.quantity}", modifier = Modifier.width(40.dp), fontSize = 13.sp)
                         Text("${"%.1f".format(pct)}%", modifier = Modifier.width(48.dp), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+                if (orphanItems.isNotEmpty()) {
+                    item(key = "orphan_divider") {
+                        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                        Text(
+                            "Items not in menu",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.tertiary,
+                            modifier = Modifier.padding(vertical = 4.dp),
+                        )
+                    }
+                    itemsIndexed(orphanItems, key = { _, sale -> "orphan_list_${sale.name}" }) { index, sale ->
+                        val pct = (sale.quantity * 100.0 / totalQty)
+                        Row(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+                            Text("${itemsToShow.size + index + 1}", modifier = Modifier.width(28.dp), fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(sale.name, modifier = Modifier.weight(1f), fontSize = 13.sp)
+                            Text("${sale.quantity}", modifier = Modifier.width(40.dp), fontSize = 13.sp)
+                            Text("${"%.1f".format(pct)}%", modifier = Modifier.width(48.dp), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
                     }
                 }
             }
@@ -853,41 +933,126 @@ fun AdminCsvSection(csvManager: CsvManager) {
     var exporting by remember { mutableStateOf(false) }
     var exportDone by remember { mutableStateOf(false) }
     var backupFiles by remember { mutableStateOf(csvManager.listBackupFiles()) }
-    var showImportWarning by remember { mutableStateOf(false) }
     var importing by remember { mutableStateOf(false) }
-    var importResult by remember { mutableStateOf<CsvManager.ImportResult?>(null) }
-    var syncing by remember { mutableStateOf(false) }
-    var syncResult by remember { mutableStateOf<String?>(null) }
+    var pendingSection by remember { mutableStateOf<CsvManager.ImportSection?>(null) }
+    var showReplaceWarning by remember { mutableStateOf(false) }
+    var showArchiveWarning by remember { mutableStateOf(false) }
+    var showRowConfirm by remember { mutableStateOf(false) }
+    var pendingFile by remember { mutableStateOf<java.io.File?>(null) }
+    var pendingFileName by remember { mutableStateOf("") }
+    var pendingRowCount by remember { mutableStateOf(0) }
+    var showDateWarning by remember { mutableStateOf(false) }
+    var pendingDateWarning by remember { mutableStateOf<String?>(null) }
+    var sectionResults by remember {
+        mutableStateOf<Map<CsvManager.ImportSection, CsvManager.SectionImportResult>>(emptyMap())
+    }
 
-    // Directory picker for import
-    val dirPicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocumentTree()
+    fun proceedToImportConfirm(file: java.io.File, fileName: String, section: CsvManager.ImportSection, rowCount: Int) {
+        pendingFile = file
+        pendingFileName = fileName
+        pendingSection = section
+        pendingRowCount = rowCount
+        val warning = csvManager.checkDateFormatWarning(file, section)
+        if (warning != null) {
+            pendingDateWarning = warning
+            showDateWarning = true
+        } else {
+            showRowConfirm = true
+        }
+    }
+
+    fun sectionLabel(section: CsvManager.ImportSection): String = when (section) {
+        CsvManager.ImportSection.ORDERS -> "orders"
+        CsvManager.ImportSection.MENU -> "menu items"
+        CsvManager.ImportSection.SPENDING -> "spending"
+    }
+
+    fun copyPickedFile(uri: android.net.Uri): Pair<java.io.File, String>? {
+        val name = context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+            if (cursor.moveToFirst() && nameIndex >= 0) cursor.getString(nameIndex) else null
+        } ?: uri.lastPathSegment ?: "import.csv"
+        val tempFile = java.io.File(context.cacheDir, "import_${System.currentTimeMillis()}.csv")
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            tempFile.outputStream().use { output -> input.copyTo(output) }
+        } ?: return null
+        return tempFile to name
+    }
+
+    fun processPickedFile(file: java.io.File, fileName: String, section: CsvManager.ImportSection) {
+        if (!csvManager.validateFilename(fileName, section)) {
+            sectionResults = sectionResults + (section to CsvManager.SectionImportResult(
+                success = false,
+                message = "Expected filename: ${csvManager.expectedFilenameHint(section)}. Please select the correct file.",
+            ))
+            file.delete()
+            return
+        }
+        if (csvManager.isMonthlyArchive(fileName)) {
+            pendingFile = file
+            pendingFileName = fileName
+            pendingSection = section
+            showArchiveWarning = true
+            return
+        }
+        val headerCheck = csvManager.validateHeaders(file, section)
+        if (!headerCheck.valid) {
+            sectionResults = sectionResults + (section to CsvManager.SectionImportResult(
+                success = false,
+                message = headerCheck.errorMessage ?: "Invalid file structure.",
+            ))
+            file.delete()
+            return
+        }
+        proceedToImportConfirm(file, fileName, section, headerCheck.rowCount)
+    }
+
+    fun runImport() {
+        val file = pendingFile ?: return
+        val fileName = pendingFileName
+        val section = pendingSection ?: return
+        scope.launch {
+            importing = true
+            val result = csvManager.importSection(file, fileName, section)
+            sectionResults = sectionResults + (section to result)
+            if (result.success) backupFiles = csvManager.listBackupFiles()
+            file.delete()
+            pendingFile = null
+            pendingFileName = ""
+            pendingSection = null
+            importing = false
+        }
+    }
+
+    val filePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
     ) { uri ->
-        if (uri != null) {
-            val docFile = androidx.documentfile.provider.DocumentFile.fromTreeUri(context, uri)
-            // Copy CSVs to a temp dir for processing
-            scope.launch {
-                importing = true
-                try {
-                    val tempDir = java.io.File(context.cacheDir, "import_temp")
-                    if (tempDir.exists()) tempDir.deleteRecursively()
-                    tempDir.mkdirs()
-
-                    docFile?.listFiles()?.filter { it.name?.endsWith(".csv") == true }?.forEach { docF ->
-                        val inputStream = context.contentResolver.openInputStream(docF.uri)
-                        val outFile = java.io.File(tempDir, docF.name ?: "unknown.csv")
-                        inputStream?.use { ins -> outFile.outputStream().use { outs -> ins.copyTo(outs) } }
-                    }
-
-                    val result = csvManager.importFromDirectory(tempDir)
-                    importResult = result
-                    tempDir.deleteRecursively()
-                    backupFiles = csvManager.listBackupFiles()
-                } catch (e: Exception) {
-                    importResult = CsvManager.ImportResult(false, "Import failed: ${e.message}")
+        val section = pendingSection ?: return@rememberLauncherForActivityResult
+        if (uri == null) {
+            pendingSection = null
+            return@rememberLauncherForActivityResult
+        }
+        scope.launch {
+            importing = true
+            try {
+                val (file, name) = copyPickedFile(uri) ?: run {
+                    sectionResults = sectionResults + (section to CsvManager.SectionImportResult(
+                        success = false,
+                        message = "Could not read the selected file.",
+                    ))
+                    pendingSection = null
+                    importing = false
+                    return@launch
                 }
-                importing = false
+                processPickedFile(file, name, section)
+            } catch (e: Exception) {
+                sectionResults = sectionResults + (section to CsvManager.SectionImportResult(
+                    success = false,
+                    message = "Import failed: ${e.message}",
+                ))
+                pendingSection = null
             }
+            importing = false
         }
     }
 
@@ -979,68 +1144,185 @@ fun AdminCsvSection(csvManager: CsvManager) {
             Text("✅ Export complete! All CSV files regenerated from current data.", color = Olive, style = MaterialTheme.typography.bodySmall)
         }
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(16.dp))
 
-        // Sync from CSV button
-        OutlinedButton(
-            onClick = {
-                syncing = true
-                syncResult = null
-                scope.launch {
-                    val result = csvManager.syncFromCsv()
-                    syncResult = if (result.success) "✅ Synced: ${result.menuItemsImported} items, ${result.spendsImported} spends, ${result.ordersImported} orders"
-                    else "❌ ${result.message}"
-                    syncing = false
-                    backupFiles = csvManager.listBackupFiles()
-                }
-            },
-            enabled = !syncing,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            if (syncing) CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-            else { Icon(Icons.Default.Sync, contentDescription = null); Spacer(modifier = Modifier.width(8.dp)); Text("Sync from CSV") }
-        }
-        syncResult?.let {
-            Text(it, style = MaterialTheme.typography.bodySmall, color = if (it.startsWith("✅")) Olive else MaterialTheme.colorScheme.error)
-        }
-
+        Text("Import from backup", fontWeight = FontWeight.SemiBold)
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(
+            "Tip: Use the *_latest.csv file for import — it has the most recent data. " +
+                "Files like makulu_orders_2026-06.csv are monthly archives from export; " +
+                "only use those if you need to restore a specific past month.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Import from directory button
-        OutlinedButton(
-            onClick = { showImportWarning = true },
-            enabled = !importing,
-            modifier = Modifier.fillMaxWidth(),
-            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.tertiary)
-        ) {
-            if (importing) CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-            else { Icon(Icons.Default.FileDownload, contentDescription = null); Spacer(modifier = Modifier.width(8.dp)); Text("Import from Directory") }
-        }
-        importResult?.let { result ->
-            Text(
-                if (result.success) "✅ Imported: ${result.menuItemsImported} menu items, ${result.spendsImported} spends, ${result.ordersImported} orders"
-                else "❌ ${result.message}",
-                style = MaterialTheme.typography.bodySmall,
-                color = if (result.success) Olive else MaterialTheme.colorScheme.error
-            )
+        listOf(
+            CsvManager.ImportSection.ORDERS to "Import Orders",
+            CsvManager.ImportSection.MENU to "Import Menu Items",
+            CsvManager.ImportSection.SPENDING to "Import Spending",
+        ).forEach { (section, label) ->
+            OutlinedButton(
+                onClick = {
+                    pendingSection = section
+                    showReplaceWarning = true
+                },
+                enabled = !importing,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                if (importing && pendingSection == section) {
+                    CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                } else {
+                    Icon(Icons.Default.FileDownload, contentDescription = null)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(label)
+                }
+            }
+            sectionResults[section]?.let { result ->
+                Text(
+                    if (result.success) "✅ ${result.message}" else "❌ ${result.message}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (result.success) Olive else MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(bottom = 4.dp),
+                )
+            }
+            Spacer(modifier = Modifier.height(4.dp))
         }
 
-        // Import warning dialog
-        if (showImportWarning) {
+        if (showReplaceWarning) {
+            val section = pendingSection
             AlertDialog(
-                onDismissRequest = { showImportWarning = false },
-                title = { Text("⚠️ Replace All Data?") },
+                onDismissRequest = { showReplaceWarning = false; pendingSection = null },
+                title = { Text("⚠️ Replace ${section?.let { sectionLabel(it) } ?: "data"}?") },
                 text = {
-                    Text("Importing will REPLACE all existing data (orders, menu items, spending) with the CSV files you select.\n\nThis cannot be undone. If you want to merge data, merge the CSV files externally first, then import.")
+                    Text(
+                        "Importing will REPLACE all existing ${section?.let { sectionLabel(it) } ?: "data"} " +
+                            "with the CSV file you select. Other sections (menu, orders, spending) stay unchanged.\n\n" +
+                            "This cannot be undone.",
+                    )
                 },
                 confirmButton = {
-                    TextButton(onClick = { showImportWarning = false; dirPicker.launch(null) }) {
-                        Text("Import & Replace", color = MaterialTheme.colorScheme.error)
+                    TextButton(onClick = {
+                        showReplaceWarning = false
+                        filePicker.launch(arrayOf("text/csv", "text/comma-separated-values", "application/csv", "*/*"))
+                    }) {
+                        Text("Continue", color = MaterialTheme.colorScheme.error)
                     }
                 },
                 dismissButton = {
-                    TextButton(onClick = { showImportWarning = false }) { Text("Cancel") }
-                }
+                    TextButton(onClick = { showReplaceWarning = false; pendingSection = null }) { Text("Cancel") }
+                },
+            )
+        }
+
+        if (showArchiveWarning) {
+            val section = pendingSection
+            AlertDialog(
+                onDismissRequest = {
+                    showArchiveWarning = false
+                    pendingFile?.delete()
+                    pendingFile = null
+                    pendingSection = null
+                },
+                title = { Text("Monthly archive selected") },
+                text = {
+                    Text(
+                        "You selected a monthly archive (`$pendingFileName`). " +
+                            "For the most up-to-date data, prefer `${section?.let { csvManager.latestFilenameHint(it) }}`. Continue anyway?",
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        showArchiveWarning = false
+                        val file = pendingFile
+                        val sectionLocal = pendingSection
+                        if (file != null && sectionLocal != null) {
+                            val headerCheck = csvManager.validateHeaders(file, sectionLocal)
+                            if (!headerCheck.valid) {
+                                sectionResults = sectionResults + (sectionLocal to CsvManager.SectionImportResult(
+                                    success = false,
+                                    message = headerCheck.errorMessage ?: "Invalid file structure.",
+                                ))
+                                file.delete()
+                                pendingFile = null
+                                pendingSection = null
+                            } else {
+                                proceedToImportConfirm(file, pendingFileName, sectionLocal, headerCheck.rowCount)
+                            }
+                        }
+                    }) { Text("Continue") }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        showArchiveWarning = false
+                        pendingFile?.delete()
+                        pendingFile = null
+                        pendingSection = null
+                    }) { Text("Cancel") }
+                },
+            )
+        }
+
+        if (showDateWarning) {
+            AlertDialog(
+                onDismissRequest = {
+                    showDateWarning = false
+                    pendingDateWarning = null
+                    pendingFile?.delete()
+                    pendingFile = null
+                    pendingSection = null
+                },
+                title = { Text("Date format notice") },
+                text = { Text(pendingDateWarning ?: "") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        showDateWarning = false
+                        pendingDateWarning = null
+                        showRowConfirm = true
+                    }) { Text("Continue") }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        showDateWarning = false
+                        pendingDateWarning = null
+                        pendingFile?.delete()
+                        pendingFile = null
+                        pendingSection = null
+                    }) { Text("Cancel") }
+                },
+            )
+        }
+
+        if (showRowConfirm) {
+            val section = pendingSection
+            AlertDialog(
+                onDismissRequest = {
+                    showRowConfirm = false
+                    pendingFile?.delete()
+                    pendingFile = null
+                    pendingSection = null
+                },
+                title = { Text("Confirm import") },
+                text = {
+                    Text(
+                        "Import $pendingRowCount rows from `$pendingFileName`? " +
+                            "This will replace all ${section?.let { sectionLabel(it) } ?: "data"}.",
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        showRowConfirm = false
+                        runImport()
+                    }) { Text("Import") }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        showRowConfirm = false
+                        pendingFile?.delete()
+                        pendingFile = null
+                        pendingSection = null
+                    }) { Text("Cancel") }
+                },
             )
         }
 
@@ -1059,6 +1341,178 @@ fun AdminCsvSection(csvManager: CsvManager) {
                 }
             }
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SETTINGS SCREEN
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Composable
+fun SettingsScreen(
+    settingsRepo: SettingsRepository,
+    appResetManager: AppResetManager,
+    themeMode: String,
+    onThemeChange: (String) -> Unit,
+    onAppReset: () -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    var showResetWarning by remember { mutableStateOf(false) }
+    var showResetPin by remember { mutableStateOf(false) }
+    var resetPin by remember { mutableStateOf("") }
+    var resetError by remember { mutableStateOf<String?>(null) }
+    var resetting by remember { mutableStateOf(false) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+    ) {
+        Text("Settings", style = MaterialTheme.typography.titleLarge)
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Text("Appearance", fontWeight = FontWeight.SemiBold)
+        Spacer(modifier = Modifier.height(8.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            listOf("light" to "Light", "dark" to "Dark", "system" to "System").forEach { (mode, label) ->
+                FilterChip(
+                    selected = themeMode == mode,
+                    onClick = { onThemeChange(mode) },
+                    label = { Text(label) },
+                    modifier = Modifier.weight(1f),
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+        HorizontalDivider()
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Text("Danger zone", fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.error)
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            "Reset App wipes all data (orders, menu, spending, tables, settings) and CSV backups, " +
+                "like a fresh install. You will need to set up your admin PIN again.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(modifier = Modifier.height(12.dp))
+        OutlinedButton(
+            onClick = { showResetWarning = true },
+            enabled = !resetting,
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+        ) {
+            Icon(Icons.Default.DeleteForever, contentDescription = null)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Reset App")
+        }
+    }
+
+    if (showResetWarning) {
+        AlertDialog(
+            onDismissRequest = { showResetWarning = false },
+            title = { Text("⚠️ Reset App?") },
+            text = {
+                Text(
+                    "This will permanently delete all app data and CSV backups. " +
+                        "The app will restart setup as if newly installed. This cannot be undone.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showResetWarning = false
+                    resetPin = ""
+                    resetError = null
+                    showResetPin = true
+                }) {
+                    Text("Continue", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showResetWarning = false }) { Text("Cancel") }
+            },
+        )
+    }
+
+    if (showResetPin) {
+        AlertDialog(
+            onDismissRequest = {
+                if (!resetting) {
+                    showResetPin = false
+                    resetPin = ""
+                    resetError = null
+                }
+            },
+            title = { Text("Enter Admin PIN") },
+            text = {
+                Column {
+                    Text("Confirm your admin PIN to reset the app.", style = MaterialTheme.typography.bodyMedium)
+                    Spacer(modifier = Modifier.height(12.dp))
+                    OutlinedTextField(
+                        value = resetPin,
+                        onValueChange = {
+                            if (it.length <= 4 && it.all { c -> c.isDigit() }) resetPin = it
+                        },
+                        label = { Text("4-digit PIN") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        textStyle = makuluTextFieldTextStyle(),
+                        colors = makuluOutlinedTextFieldColors(),
+                    )
+                    resetError?.let {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        if (resetPin.length != 4) {
+                            resetError = "PIN must be 4 digits"
+                            return@TextButton
+                        }
+                        scope.launch {
+                            resetting = true
+                            val savedPin = settingsRepo.get(SettingsRepository.KEY_ADMIN_PIN)
+                            if (resetPin != savedPin) {
+                                resetError = "Incorrect PIN"
+                                resetPin = ""
+                                resetting = false
+                                return@launch
+                            }
+                            appResetManager.resetApp()
+                            showResetPin = false
+                            resetting = false
+                            onAppReset()
+                        }
+                    },
+                    enabled = !resetting,
+                ) {
+                    if (resetting) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    } else {
+                        Text("Reset", color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showResetPin = false
+                        resetPin = ""
+                        resetError = null
+                    },
+                    enabled = !resetting,
+                ) { Text("Cancel") }
+            },
+        )
     }
 }
 
@@ -2233,7 +2687,15 @@ fun ShopSpendingSidebar(vm: SpendingViewModel = hiltViewModel()) {
                 Column {
                     OutlinedTextField(value = newItemName, onValueChange = { newItemName = sanitizeInput(it, 50) }, label = { Text("Item Name") }, singleLine = true, colors = makuluOutlinedTextFieldColors())
                     Spacer(modifier = Modifier.height(8.dp))
-                    OutlinedTextField(value = newAmount, onValueChange = { newAmount = it }, label = { Text("Amount (₹)") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal), singleLine = true)
+                    OutlinedTextField(
+                        value = newAmount,
+                        onValueChange = { newAmount = it },
+                        label = { Text("Amount (₹)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        singleLine = true,
+                        textStyle = makuluTextFieldTextStyle(),
+                        colors = makuluOutlinedTextFieldColors(),
+                    )
                     Spacer(modifier = Modifier.height(8.dp))
                     OutlinedButton(onClick = { showDatePicker = true }, modifier = Modifier.fillMaxWidth()) {
                         Icon(Icons.Default.CalendarToday, contentDescription = null, modifier = Modifier.size(16.dp))
